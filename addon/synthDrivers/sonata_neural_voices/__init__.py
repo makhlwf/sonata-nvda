@@ -13,6 +13,8 @@ import synthDriverHandler
 from autoSettingsUtils.driverSetting import DriverSetting, NumericDriverSetting
 from nvwave import WavePlayer
 from logHandler import log
+# Import for config change notifications
+from config.config import ConfigManager
 from speech import sayAll
 from speech.commands import (
     BreakCommand,
@@ -127,11 +129,13 @@ def SpeakerSetting():
     )
 
 def create_wave_player(sample_rate):
+    device_id = config.conf["speech"]["outputDevice"]
+    log.info(f"Creating WavePlayer: sample_rate={sample_rate}, outputDevice='{device_id}'")
     return WavePlayer(
         channels=1,
         samplesPerSec=sample_rate,
         bitsPerSample=16,
-        outputDevice=config.conf["speech"]["outputDevice"],
+        outputDevice=device_id,
         buffered=True,
     )
 
@@ -237,7 +241,52 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         self.availableVoices = self._get_valid_voices()
         self.__voice = None
 
+        # Audio device change handling
+        self._current_output_device = config.conf["speech"]["outputDevice"]
+        if hasattr(config.conf.spec["speech"]["outputDevice"], "postChange"):
+            config.conf.spec["speech"]["outputDevice"].postChange.add(self.on_output_device_changed)
+        else:
+            # Older NVDA versions might not have postChange on individual spec items.
+            # As a fallback, consider listening to a more general config change signal if necessary,
+            # but the manifest restricts to 2025.1+ where this should exist.
+            log.warning("Could not attach postChange handler to speech.outputDevice. Dynamic audio device switching may not work.")
+
+    def on_output_device_changed(self, event=None):
+        """Handles changes to NVDA's audio output device."""
+        new_device = config.conf["speech"]["outputDevice"]
+        if self._current_output_device == new_device:
+            return
+
+        log.info(f"NVDA audio output device changed from '{self._current_output_device}' to '{new_device}'. Reinitializing Piper audio.")
+        self._current_output_device = new_device
+
+        self.cancel()  # Stop current speech
+
+        # Close all existing players
+        for player in self._players.values():
+            player.close()
+        self._players.clear()
+
+        # Re-create the primary player for the current voice's sample rate
+        # This will use the new device via create_wave_player
+        if self.tts and self.tts.speech_options and self.tts.speech_options.voice:
+            current_sample_rate = self.tts.speech_options.voice.sample_rate
+            self._player = self._get_or_create_player(current_sample_rate)
+            # Re-apply current volume to the new player
+            self._set_volume(self.volume)
+        else:
+            log.error("Cannot reinitialize player: TTS or voice options not available.")
+
+
     def terminate(self):
+        # Unsubscribe from config change notifications
+        if hasattr(config.conf.spec["speech"]["outputDevice"], "postChange"):
+            try:
+                config.conf.spec["speech"]["outputDevice"].postChange.remove(self.on_output_device_changed)
+            except ValueError: # pragma: no cover
+                # Can happen if it was never added or already removed
+                pass
+
         self.cancel()
         self.tts.shutdown()
         for player in self._players.values():
